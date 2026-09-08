@@ -44,6 +44,7 @@ TRUST MODEL (research-grounded)
 
 import os
 import sys
+import shutil
 import json
 import math
 import time
@@ -56,7 +57,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
@@ -78,6 +79,7 @@ NEUTRAL_TRUST = 50.0              # prior trust before any experience
 INCIDENT_HALF_LIFE_DAYS = 30.0    # exponential decay for incident weighting
 VELOCITY_WINDOW_DAYS = 30.0       # recent window for trend / volatility
 VELOCITY_CHANGE_THRESHOLD = 0.15  # pts/day beyond which trust is changing
+GAP_SIGNIFICANT = 15.0             # pts gap between live trust and ABI baseline worth flagging
 HISTORY_CAP = 2000
 
 SAFE_THRESHOLD = 67
@@ -104,7 +106,20 @@ FAVOR_VALUES = {1: 60, 2: 75, 3: 90}
 
 EVENT_MARKERS = {"assessment": "\u25cf", "incident": "\u25bc", "favor": "\u25b2"}
 
-console = Console(width=100)
+console = Console()
+
+
+def _term_size():
+    """Return the current terminal size as (columns, rows).
+
+    Falls back to 80x24 when the size cannot be determined. Honors the
+    COLUMNS/LINES environment variables via ``shutil.get_terminal_size``,
+    which also makes the layout testable in non-interactive shells.
+    """
+    size = shutil.get_terminal_size((80, 24))
+    return size.columns, size.lines
+
+
 # ---------------------------------------------------------------------------
 # Security & key management
 # ---------------------------------------------------------------------------
@@ -323,6 +338,69 @@ def recommendation(profile, score: float) -> str:
     return " ".join(parts)
 
 
+def trajectory_summary(profile) -> str:
+    """Concise narrative summary derived from the trust trajectory (graph)."""
+    score = current_trust(profile)
+    base = compute_raw_trust_score(profile)
+    band, _ = score_band(score)
+    vel = trust_velocity(profile)
+    vol = trust_volatility(profile)
+    change = total_change(profile)
+    impact = incident_impact(profile)
+    gap = score - base
+
+    direction = _velocity_note(vel)
+    stability = _volatility_note(vol)
+
+    if direction == "deteriorating" and stability == "highly unstable":
+        pattern = "Sharp volatile decline"
+    elif direction == "deteriorating":
+        pattern = "Steady decline"
+    elif direction == "improving" and stability == "highly unstable":
+        pattern = "Improving but erratic"
+    elif direction == "improving":
+        pattern = "Steady improvement"
+    elif stability == "highly unstable":
+        pattern = "Erratic, no clear trend"
+    elif stability == "some instability":
+        pattern = "Roughly stable with wobble"
+    else:
+        pattern = "Stable and predictable"
+
+    parts = []
+    if band == "Safe":
+        parts.append("High trust - the relationship appears reliable and low-risk.")
+    elif band == "Caution":
+        parts.append("Moderate trust - verify key interactions and stay observant.")
+    else:
+        parts.append("High risk - minimize exposure; consider protective boundaries.")
+
+    traj = (f"Pattern: {pattern} ({vel:+.2f}/day, vol {vol:.1f}, "
+            f"{change:+.0f} pts overall")
+    if gap <= -GAP_SIGNIFICANT:
+        traj += f", now {gap:+.0f} pts below the {base:.0f}% ABI baseline)"
+    elif gap >= GAP_SIGNIFICANT:
+        traj += f", now {gap:+.0f} pts above the {base:.0f}% ABI baseline)"
+    else:
+        traj += f", in line with the {base:.0f}% ABI baseline)"
+    parts.append(traj)
+
+    if profile["reciprocity"] == "Parasitic":
+        parts.append("Parasitic exchange detected - a strong red flag.")
+    elif profile["reciprocity"] == "Transactional":
+        parts.append("Transactional reciprocity - keep expectations explicit.")
+    else:
+        parts.append("Synergistic reciprocity - balanced mutual benefit.")
+
+    parts.append(f"Suggested boundary strategy: {profile['boundary_strategy']}.")
+    if impact >= 3.0:
+        parts.append("Multiple recent red flags logged - treat with heightened caution.")
+    elif impact >= 1.0:
+        parts.append("Recent incident(s) logged.")
+
+    return " ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Sample data (demo / testing)
 # ---------------------------------------------------------------------------
@@ -418,8 +496,15 @@ def _resample_series(series, width):
     return values
 
 
-def render_chart(profile, width=66, height=20):
-    """Render the trust time series as an inline Unicode chart."""
+def render_chart(profile, width=None, height=None):
+    """Render the trust time series as an inline Unicode chart, sized to the terminal."""
+    cols, rows = _term_size()
+    if width is None:
+        width = max(16, cols - 14)
+    if height is None:
+        height = max(5, min(20, rows - 12))
+    width = int(width)
+    height = int(height)
     series = compute_trust_series(profile)
     values = _resample_series(series, width)
     step = 100.0 / height
@@ -452,8 +537,12 @@ def render_chart(profile, width=66, height=20):
 
     # date axis
     if series:
-        d0 = _fmt_date(series[0][0])
-        d1 = _fmt_date(series[-1][0])
+        if width >= 24:
+            d0 = _fmt_date(series[0][0])
+            d1 = _fmt_date(series[-1][0])
+        else:
+            d0 = _fmt_date_short(series[0][0])
+            d1 = _fmt_date_short(series[-1][0])
         gap = max(1, width - len(d0) - len(d1))
         lines.append("    " + d0 + " " * gap + d1)
 
@@ -488,7 +577,7 @@ class VaultCLI:
         self._banner()
         while True:
             try:
-                raw = input("\n> ").strip()
+                raw = input("> ").strip()
             except (EOFError, KeyboardInterrupt):
                 console.print()
                 break
@@ -542,8 +631,22 @@ class VaultCLI:
     def _clear_screen(self):
         os.system("cls" if os.name == "nt" else "clear")
 
-    def _banner(self):
+    def _begin_page(self):
+        """Clear the screen and lock the console to the current terminal width.
+
+        Every display command starts with this so its output is a single,
+        full-screen page rather than an ever-growing scrollback.
+        """
         self._clear_screen()
+        cols, _rows = _term_size()
+        console.width = cols
+
+    def _line_count(self, renderable):
+        """Number of terminal rows a renderable occupies at the current width."""
+        return len(console.render_lines(renderable))
+
+    def _banner(self):
+        self._begin_page()
         total = len(self.vault["profiles"])
         console.print(Panel(
             f"[bold]{APP_NAME}[/bold]\n"
@@ -554,10 +657,9 @@ class VaultCLI:
         self._banner()
 
     def _help(self):
-        t = Table(title="Commands", box=box.ROUNDED, border_style="cyan")
-        t.add_column("Command", style="bold cyan", no_wrap=True)
-        t.add_column("Description")
-        for cmd, desc in [
+        self._begin_page()
+        avail = _term_size()[1] - 1
+        commands = [
             ("list / ls [query]", "List profiles with their time-series trust score"),
             ("view / v <id|name>", "Full detail: chart, metrics, event timeline"),
             ("plot / chart <id|name>", "Show just the trust time-series chart"),
@@ -571,11 +673,28 @@ class VaultCLI:
             ("clear / cls", "Clear the screen"),
             ("help / ?", "Show this help"),
             ("quit / exit / q", "Save, encrypt and exit"),
-        ]:
-            t.add_row(cmd, desc)
-        console.print(t)
+        ]
+
+        def render(n):
+            t = Table(title="Commands", box=box.ROUNDED, border_style="cyan")
+            t.add_column("Command", style="bold cyan", no_wrap=True)
+            t.add_column("Description")
+            for cmd, desc in commands[:n]:
+                t.add_row(cmd, desc)
+            if n < len(commands):
+                note = (f"[dim]… {len(commands) - n} more command(s) hidden "
+                        f"(terminal too short).[/dim]")
+                return Group(t, note)
+            return t
+
+        n = len(commands)
+        while n > 1 and self._line_count(render(n)) > avail:
+            n -= 1
+        console.print(render(n))
 
     def _list(self, query=""):
+        self._begin_page()
+        avail = _term_size()[1] - 1
         q = (query or "").lower()
         rows = []
         for i, p in enumerate(self.vault["profiles"], 1):
@@ -585,21 +704,32 @@ class VaultCLI:
         if not rows:
             console.print("[yellow]No profiles match.[/yellow]")
             return
-        t = Table(title="Profiles", box=box.ROUNDED, border_style="cyan")
-        t.add_column("#", justify="right", style="dim")
-        t.add_column("Name", style="bold")
-        t.add_column("Category")
-        t.add_column("Trust", justify="right")
-        t.add_column("Trend", justify="center")
-        t.add_column("Status")
-        for i, p in rows:
-            score = current_trust(p)
-            band, color = score_band(score)
-            vel = trust_velocity(p)
-            trend = "\u2197" if vel > VELOCITY_CHANGE_THRESHOLD else ("\u2198" if vel < -VELOCITY_CHANGE_THRESHOLD else "\u2192")
-            t.add_row(str(i), p.get("name") or "Unnamed", p.get("category", ""),
-                      f"{score:.0f}%", trend, f"[{color}]{band}[/{color}]")
-        console.print(t)
+
+        def render(n):
+            t = Table(title="Profiles", box=box.ROUNDED, border_style="cyan")
+            t.add_column("#", justify="right", style="dim")
+            t.add_column("Name", style="bold")
+            t.add_column("Category")
+            t.add_column("Trust", justify="right")
+            t.add_column("Trend", justify="center")
+            t.add_column("Status")
+            for i, p in rows[:n]:
+                score = current_trust(p)
+                band, color = score_band(score)
+                vel = trust_velocity(p)
+                trend = "\u2197" if vel > VELOCITY_CHANGE_THRESHOLD else ("\u2198" if vel < -VELOCITY_CHANGE_THRESHOLD else "\u2192")
+                t.add_row(str(i), p.get("name") or "Unnamed", p.get("category", ""),
+                          f"{score:.0f}%", trend, f"[{color}]{band}[/{color}]")
+            if n < len(rows):
+                note = (f"[dim]… showing {n} of {len(rows)} profile(s). "
+                        f"Use a search query to narrow.[/dim]")
+                return Group(t, note)
+            return t
+
+        n = len(rows)
+        while n > 1 and self._line_count(render(n)) > avail:
+            n -= 1
+        console.print(render(n))
 
     def _find(self, arg):
         profiles = self.vault["profiles"]
@@ -630,11 +760,15 @@ class VaultCLI:
         p = self._find(arg)
         if p is None:
             return
+        self._begin_page()
         score = current_trust(p)
         band, color = score_band(score)
+        rows = _term_size()[1]
+        chart_h = max(3, min(20, rows - 8))
         console.print(f"[bold]{p.get('name') or 'Unnamed'}[/bold]  "
                       f"[{color}]trust {score:.0f}% ({band})[/{color}]")
-        console.print(render_chart(p))
+        console.print(render_chart(p, height=chart_h))
+        console.print(f"[italic dim]{trajectory_summary(p)}[/italic dim]")
 
     def _view(self, arg):
         p = self._find(arg)
@@ -647,42 +781,91 @@ class VaultCLI:
         vol = trust_volatility(p)
         change = total_change(p)
         impact = incident_impact(p)
+        gap = score - base
+        if gap <= -GAP_SIGNIFICANT:
+            gap_label = f"[{COLOR_HIGH_RISK}]gap {gap:+.0f} pts[/{COLOR_HIGH_RISK}]"
+        elif gap >= GAP_SIGNIFICANT:
+            gap_label = f"[{COLOR_SAFE}]gap {gap:+.0f} pts[/{COLOR_SAFE}]"
+        else:
+            gap_label = f"[dim]gap {gap:+.0f} pts[/dim]"
 
-        lines = []
-        lines.append(f"[bold]{p.get('name') or 'Unnamed'}[/bold]  [dim]{p.get('category', '')}[/dim]")
-        lines.append("")
-        lines.append(f"[{color}]{_bar(score)}[/{color}]  [{color}]{score:.0f}%  {band}[/{color}]")
-        lines.append(f"[dim]current assessment (ABI): {base:.0f}%   "
-                     f"total change: {change:+.0f} pts[/dim]")
-        lines.append("")
-        lines.append(f"[bold]Benevolence[/bold] {p['benevolence']}/10   "
-                     f"[bold]Integrity[/bold] {p['integrity']}/10   "
-                     f"[bold]Ability[/bold] {p['ability']}/10")
-        lines.append(f"[bold]Dark Triad[/bold]: {p['dark_triad_risk']}")
-        lines.append(f"[bold]Reciprocity[/bold]: {p['reciprocity']}    "
-                     f"[bold]Boundary[/bold]: {p['boundary_strategy']}")
-        lines.append("")
-        lines.append("[bold]Trust time series[/bold]")
-        lines.append(render_chart(p))
-        lines.append("")
-        lines.append("[bold]Analysis[/bold]")
-        lines.append(f"  Trend velocity:  {vel:+.2f} pts/day  ({_velocity_note(vel)})")
-        lines.append(f"  Volatility:      {vol:.2f}  ({_volatility_note(vol)})")
-        lines.append(f"  Total change:    {change:+.1f} pts")
-        lines.append(f"  Incident load:   {impact:.2f}  (recency-weighted)")
-        lines.append("")
-        lines.append("[bold]Recent events[/bold]")
-        events = sorted(p.get("events", []), key=lambda e: e["ts"], reverse=True)[:6]
-        for e in events:
-            marker = EVENT_MARKERS.get(e["kind"], "\u25cf")
-            date = _fmt_date(e["ts"])
-            note = e.get("note") or ""
-            lines.append(f"  {marker} {date}  {note}  [dim](value {e['value']:.0f})[/dim]")
-        lines.append("")
-        lines.append(f"[italic dim]{recommendation(p, score)}[/italic dim]")
-        console.print(Panel("\n".join(lines), border_style=color, box=box.ROUNDED))
+        events = sorted(p.get("events", []), key=lambda e: e["ts"], reverse=True)
+        cols, rows = _term_size()
+        compact = cols < 55
+        self._begin_page()
+
+        def build(chart_h=None, max_events=6, show_rec=True):
+            lines = []
+            lines.append(f"[bold]{p.get('name') or 'Unnamed'}[/bold]  "
+                         f"[dim]{p.get('category', '')}[/dim]  "
+                         f"[{color}]trust {score:.0f}% ({band})[/{color}]")
+            lines.append(f"[{color}]{_bar(score)}[/{color}]")
+            if compact:
+                lines.append(f"[dim]ABI {base:.0f}%   trust {score:.0f}%   {gap_label}   \u0394 {change:+.0f} pts[/dim]")
+                lines.append(f"[dim]Ben {p['benevolence']}/10  Int {p['integrity']}/10  "
+                             f"Abi {p['ability']}/10[/dim]")
+                lines.append(f"[dim]Dark {p['dark_triad_risk']}  "
+                             f"Recip {p['reciprocity']}  Bound {p['boundary_strategy']}[/dim]")
+            else:
+                lines.append(f"[dim]assessment (ABI) {base:.0f}%   "
+                             f"live trust {score:.0f}%   {gap_label}   "
+                             f"total change {change:+.0f} pts[/dim]")
+                lines.append(f"[dim]Benevolence {p['benevolence']}/10   "
+                             f"Integrity {p['integrity']}/10   "
+                             f"Ability {p['ability']}/10[/dim]")
+                lines.append(f"[dim]Dark Triad: {p['dark_triad_risk']}    "
+                             f"Reciprocity: {p['reciprocity']}    "
+                             f"Boundary: {p['boundary_strategy']}[/dim]")
+            lines.append("")
+            if chart_h:
+                lines.append("[bold]Trust time series[/bold]")
+                lines.append(render_chart(p, height=chart_h))
+            if compact:
+                lines.append(f"[bold]Analysis[/bold] {vel:+.2f}/day ({_velocity_note(vel)})  "
+                             f"vol {vol:.1f}  \u0394 {change:+.0f}  inc {impact:.1f}")
+            else:
+                lines.append(f"[bold]Analysis[/bold]  {vel:+.2f}/day ({_velocity_note(vel)})   "
+                             f"vol {vol:.1f} ({_volatility_note(vol)})   "
+                             f"\u0394 {change:+.0f}   incidents {impact:.1f}")
+            if max_events:
+                lines.append("[bold]Recent events[/bold]")
+                for e in events[:max_events]:
+                    marker = EVENT_MARKERS.get(e["kind"], "\u25cf")
+                    date = _fmt_date(e["ts"])
+                    note = e.get("note") or ""
+                    lines.append(f"  {marker} {date}  {note}  [dim]({e['value']:.0f})[/dim]")
+            if show_rec:
+                lines.append(f"[italic dim]{trajectory_summary(p)}[/italic dim]")
+            return Panel("\n".join(lines), border_style=color, box=box.ROUNDED)
+
+        def fits(panel):
+            return self._line_count(panel) <= rows - 1
+
+        chart_h = max(4, min(20, rows - 14))
+        max_events = min(6, len(events))
+
+        # Preference order: keep events, then shrink chart height, then drop
+        # the chart, then drop the recommendation. The first that fits wins.
+        configs = []
+        for e in range(max_events, -1, -1):
+            configs.append((chart_h, e, True))
+        for h in range(chart_h - 1, 3, -1):
+            configs.append((h, 0, True))
+        for e in range(max_events, -1, -1):
+            configs.append((None, e, True))
+        configs.append((None, 0, False))
+
+        for ch, ev, rec in configs:
+            panel = build(ch, ev, rec)
+            if fits(panel):
+                console.print(panel)
+                return
+
+        # Absolute minimum (no chart, no events, no recommendation).
+        console.print(build(None, 0, False))
     # -- mutations -------------------------------------------------------
     def _add(self):
+        self._begin_page()
         console.print(Panel("[bold]Add new profile[/bold]", border_style="cyan", box=box.ROUNDED))
         name = input("Name / alias: ").strip()
         if not name:
@@ -714,6 +897,7 @@ class VaultCLI:
         p = self._find(arg)
         if p is None:
             return
+        self._begin_page()
         console.print(Panel(f"[bold]Edit {p.get('name') or 'Unnamed'}[/bold] (blank keeps value)",
                             border_style="cyan", box=box.ROUNDED))
         v = input(f"Name [{p.get('name', '')}]: ").strip()
@@ -779,26 +963,40 @@ class VaultCLI:
         if not profiles:
             console.print("[yellow]No profiles yet.[/yellow]")
             return
+        self._begin_page()
+        rows = _term_size()[1]
         counts = {"Safe": 0, "Caution": 0, "High Risk": 0}
         for p in profiles:
             band, _ = score_band(current_trust(p))
             counts[band] += 1
-        lines = [f"[bold]Portfolio summary[/bold] - {len(profiles)} profile(s)", ""]
-        for band, color in [("Safe", COLOR_SAFE), ("Caution", COLOR_CAUTION),
-                            ("High Risk", COLOR_HIGH_RISK)]:
-            n = counts[band]
-            lines.append(f"  [{color}]{band:<11}[/{color}] [{color}]{_bar(n * 100.0 / len(profiles), 20)}[/{color}] {n}")
-        lines.append("")
-        lines.append("[bold]Highest risk (by time-series trust)[/bold]")
-        for p in sorted(profiles, key=current_trust)[:3]:
-            s = current_trust(p)
-            band, color = score_band(s)
-            lines.append(f"  [{color}]{s:>3.0f}%[/{color}]  {p.get('name') or 'Unnamed'}  [dim]({p.get('category', '')})[/dim]")
-        lines.append("")
-        lines.append("[bold]Fastest declining (30-day trend)[/bold]")
-        for p in sorted(profiles, key=trust_velocity)[:3]:
-            lines.append(f"  {trust_velocity(p):+.2f}/day  {p.get('name') or 'Unnamed'}")
-        console.print(Panel("\n".join(lines), border_style="cyan", box=box.ROUNDED))
+
+        def build(top_n):
+            lines = [f"[bold]Portfolio summary[/bold] - {len(profiles)} profile(s)", ""]
+            for band, color in [("Safe", COLOR_SAFE), ("Caution", COLOR_CAUTION),
+                                ("High Risk", COLOR_HIGH_RISK)]:
+                n = counts[band]
+                lines.append(f"  [{color}]{band:<11}[/{color}] "
+                             f"[{color}]{_bar(n * 100.0 / len(profiles), 20)}[/{color}] {n}")
+            if top_n:
+                lines.append("")
+                lines.append("[bold]Highest risk (by time-series trust)[/bold]")
+                for p in sorted(profiles, key=current_trust)[:top_n]:
+                    s = current_trust(p)
+                    band, color = score_band(s)
+                    lines.append(f"  [{color}]{s:>3.0f}%[/{color}]  "
+                                 f"{p.get('name') or 'Unnamed'}  [dim]({p.get('category', '')})[/dim]")
+                lines.append("")
+                lines.append("[bold]Fastest declining (30-day trend)[/bold]")
+                for p in sorted(profiles, key=trust_velocity)[:top_n]:
+                    lines.append(f"  {trust_velocity(p):+.2f}/day  {p.get('name') or 'Unnamed'}")
+            return Panel("\n".join(lines), border_style="cyan", box=box.ROUNDED)
+
+        top_n = 3
+        panel = build(top_n)
+        while top_n > 0 and self._line_count(panel) > rows - 1:
+            top_n -= 1
+            panel = build(top_n)
+        console.print(panel)
 
     def _export(self):
         self._persist()
