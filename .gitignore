@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sensitive vault data & encrypted backups - never commit
+*.enc
+*.enc.tmp
+vault.salt
